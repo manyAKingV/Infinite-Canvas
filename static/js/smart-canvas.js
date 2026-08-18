@@ -477,6 +477,62 @@ function smartOriginalMediaUrl(itemOrUrl){
     } catch(e) {}
     return text;
 }
+function isPublicMediaUrl(url){
+    const text = String(url || '').trim();
+    if(!/^https?:\/\//i.test(text)) return false;
+    try {
+        const host = new URL(text).hostname.toLowerCase();
+        if(host === '127.0.0.1' || host === 'localhost' || host === '::1') return false;
+        if(/^192\.168\.|^10\.|^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+    } catch(e) {
+        return false;
+    }
+    return true;
+}
+function upstreamReferenceUrl(ref){
+    const candidates = [ref?.sourceUrl, ref?.source_url, ref?.original_url, ref?.originalRemoteUrl, ref?.url];
+    for(const candidate of candidates){
+        const text = String(candidate || '').trim();
+        if(isPublicMediaUrl(text)) return text;
+    }
+    return String(ref?.url || '').trim();
+}
+function enrichReferenceFromNode(ref){
+    if(!ref || typeof ref !== 'object') return ref;
+    let enriched = {...ref};
+    if(ref.nodeId){
+        const source = nodes.find(n => n.id === ref.nodeId);
+        const imgs = source ? imagesForNode(source) : [];
+        const idx = Number.isFinite(Number(ref.imageIndex)) ? Number(ref.imageIndex) : imgs.findIndex(img => img?.url === ref.url);
+        const img = idx >= 0 ? imgs[idx] : null;
+        if(img){
+            enriched = {
+                ...enriched,
+                sourceUrl: enriched.sourceUrl || enriched.source_url || img.sourceUrl || img.source_url || '',
+                originalLocalUrl: enriched.originalLocalUrl || img.originalLocalUrl || (!isPublicMediaUrl(enriched.url) ? enriched.url : '')
+            };
+        }
+    }
+    if(enriched.originalRemoteUrl && !enriched.sourceUrl && !enriched.source_url){
+        enriched.sourceUrl = enriched.originalRemoteUrl;
+    }
+    return enriched;
+}
+function serializeSmartReference(ref, index){
+    const enriched = enrichReferenceFromNode(ref || {});
+    const upstream = upstreamReferenceUrl(enriched);
+    const localUrl = enriched.originalLocalUrl || (!isPublicMediaUrl(enriched.url) ? enriched.url : '');
+    return {
+        url: upstream || enriched.url || '',
+        name: enriched.name || `图${index + 1}`,
+        kind: enriched.kind || mediaKindForItem(enriched),
+        asset_uris: enriched.asset_uris || {},
+        role: enriched.role || `image_${index + 1}`,
+        source_url: enriched.source_url || enriched.sourceUrl || (isPublicMediaUrl(upstream) ? upstream : ''),
+        sourceUrl: enriched.sourceUrl || enriched.source_url || (isPublicMediaUrl(upstream) ? upstream : ''),
+        originalLocalUrl: localUrl || ''
+    };
+}
 function smartMediaPreviewUrl(itemOrUrl, size=512){
     const raw = smartOriginalMediaUrl(itemOrUrl);
     const displayItem = typeof itemOrUrl === 'object' && itemOrUrl ? {...itemOrUrl, url:raw} : raw;
@@ -729,6 +785,9 @@ function defaultSmartApiResolution(model){
 function mediaItemForStorage(item){
     if(!item || typeof item !== 'object') return item;
     const clean = {...item};
+    if(clean.originalRemoteUrl && !clean.sourceUrl && !clean.source_url){
+        clean.sourceUrl = clean.originalRemoteUrl;
+    }
     delete clean.cloudUrl;
     delete clean.uploadedUrl;
     delete clean.originalRemoteUrl;
@@ -1667,6 +1726,10 @@ function copyMediaSizeFields(source, target={}){
     ['natural_w','natural_h','width','height','w','h','layout_w','layout_h'].forEach(key => {
         const n = Number(source[key]);
         if(Number.isFinite(n) && n > 0) target[key] = n;
+    });
+    ['sourceUrl','source_url','originalLocalUrl'].forEach(key => {
+        const value = String(source[key] || '').trim();
+        if(value) target[key] = value;
     });
     return target;
 }
@@ -6630,6 +6693,9 @@ function resultMediaUrls(result){
                 const url = value.url || value.path || value.src || value.uri;
                 if(url){
                     const item = {url, kind:value.kind || value.type || value.mediaKind || '', name:value.name || value.filename || ''};
+                    ['source_url','sourceUrl','original_url','originalRemoteUrl','originalLocalUrl','mime'].forEach(key => {
+                        if(value[key] !== undefined && value[key] !== null && value[key] !== '') item[key] = value[key];
+                    });
                     ['natural_w','natural_h','width','height','w','h','layout_w','layout_h'].forEach(key => {
                         const n = Number(value[key]);
                         if(Number.isFinite(n) && n > 0) item[key] = n;
@@ -14628,19 +14694,20 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
         body = rhDefaultPromptSuggestion();
     }
     const displayPrompt = originalPrompt || body;
+    const serializedRefs = refs.map((img, index) => serializeSmartReference(img, index));
     if(hasMentionToken && refs.length){
         const mapText = refs.map((img, i) => `图${i + 1}：${img.name || `图片${i + 1}`}`).join('\n');
         return {
             prompt:`${tr('smart.refMapHeader')}\n${mapText}\n\n${tr('smart.refUserNeed')}\n${body}`,
             displayPrompt,
-            refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+            refs:serializedRefs,
             mentioned:true
         };
     }
     return {
         prompt:body,
         displayPrompt,
-        refs:refs.map((img, index) => ({url:img.url, name:img.name || `图${index + 1}`, kind:img.kind || mediaKindForItem(img), asset_uris:img.asset_uris || {}, role:`image_${index + 1}`})),
+        refs:serializedRefs,
         mentioned:false
     };
 }
@@ -14840,7 +14907,17 @@ function finalizePendingNode(pendingNode, urls, meta, kind='image'){
     const imgs = cleanHistoryImages(urls.map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
         const itemKind = (typeof item === 'object' && item.kind) || kind;
-        return copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true});
+        const remote = typeof item === 'object' ? (item.source_url || item.sourceUrl || item.originalRemoteUrl || '') : '';
+        const payload = copyMediaSizeFields(item, {
+            url,
+            name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`,
+            kind:itemKind,
+            generatedResult:true
+        });
+        if(isPublicMediaUrl(remote)) payload.sourceUrl = remote;
+        else if(isPublicMediaUrl(url)) payload.sourceUrl = url;
+        if(!isPublicMediaUrl(url)) payload.originalLocalUrl = url;
+        return payload;
     }).filter(img => img.url));
     pendingNode.images = imgs;
     markSmartNodeComplete(pendingNode, meta);
@@ -16379,10 +16456,10 @@ async function runApiVideoGeneration(prompt, refs, runSettings=settings){
                 if(targetPlatform && uris[targetPlatform]) return uris[targetPlatform];
                 mismatchedAsset = true;
             }
-            return ref?.url;
+            return upstreamReferenceUrl(ref) || ref?.url;
         };
         const refImages = imageRefsOnly(uploadedRefs).map((ref, i) => {
-            const item = {url:effUrl(ref), name:ref.name || `图${i + 1}`};
+            const item = serializeSmartReference(ref, i);
             if(runSettings.videoUseFrameRoles){
                 if(i === 0) item.role = 'first_frame';
                 else if(i === 1) item.role = 'last_frame';
@@ -17106,7 +17183,17 @@ function finalizeSmartPendingTask(node, taskId, images, kind='image'){
     const additions = cleanHistoryImages((mediaItems || []).map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
         const itemKind = (typeof item === 'object' && item.kind) || kind;
-        return stripImageGenerationMeta(copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true}));
+        const remote = typeof item === 'object' ? (item.source_url || item.sourceUrl || item.originalRemoteUrl || '') : '';
+        const payload = stripImageGenerationMeta(copyMediaSizeFields(item, {
+            url,
+            name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`,
+            kind:itemKind,
+            generatedResult:true
+        }));
+        if(isPublicMediaUrl(remote)) payload.sourceUrl = remote;
+        else if(isPublicMediaUrl(url)) payload.sourceUrl = url;
+        if(!isPublicMediaUrl(url)) payload.originalLocalUrl = url;
+        return payload;
     }).filter(item => item.url)).filter(item => {
         const key = `${item.kind || ''}|${item.url || ''}`;
         if(seen.has(key)) return false;

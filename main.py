@@ -6942,6 +6942,22 @@ def output_file_from_url(url):
             return path
     return None
 
+def resolve_local_media_reference(value) -> str:
+    """把画布里的本地媒体引用统一成可被 output_file_from_url 解析的路径。"""
+    text = str(value or "").strip()
+    if not text or text.startswith("data:"):
+        return ""
+    if output_file_from_url(text):
+        return text.split("?", 1)[0]
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme in {"http", "https"}:
+        host = (parsed.hostname or "").lower()
+        if host in {"127.0.0.1", "localhost", "::1"} or re.match(r"^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)", host):
+            candidate = urllib.parse.unquote(parsed.path or "")
+            if output_file_from_url(candidate):
+                return candidate.split("?", 1)[0]
+    return ""
+
 def image_has_alpha(img: Image.Image) -> bool:
     if img.mode in ("RGBA", "LA"):
         return True
@@ -8722,10 +8738,8 @@ def public_media_url_suffix() -> str:
     return f"?token={urllib.parse.quote(token)}" if token else ""
 
 def local_asset_public_url(value: str) -> str:
-    text = str(value or "").strip()
-    if not text.startswith(("/output/", "/assets/")):
-        return ""
-    if not output_file_from_url(text):
+    text = resolve_local_media_reference(value)
+    if not text:
         return ""
     base = public_base_url()
     if not base:
@@ -8740,26 +8754,19 @@ async def openai_video_proxy_public_reference_url(ref) -> str:
     text = str(raw or "").strip()
     if not text:
         return ""
-    parsed = urllib.parse.urlsplit(text)
-    local_path = ""
-    if parsed.scheme in {"http", "https"}:
-        host = (parsed.hostname or "").lower()
-        if host in {"127.0.0.1", "localhost", "::1"} or re.match(r"^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)", host):
-            local_path = urllib.parse.unquote(parsed.path or "")
-        else:
-            return text
-    elif text.startswith(("/output/", "/assets/")):
-        local_path = text
-    if local_path and output_file_from_url(local_path):
+    if text.startswith(("http://", "https://")) and not resolve_local_media_reference(text):
+        return text
+    local_ref = resolve_local_media_reference(text)
+    if local_ref:
         upload_error = ""
         try:
-            uploaded = await upload_local_video_to_cloud(local_path)
+            uploaded = await upload_local_video_to_cloud(local_ref)
             url = str((uploaded or {}).get("url") or "")
             if url.startswith(("http://", "https://")):
                 return url
         except HTTPException as exc:
             upload_error = str(exc.detail)
-        public_url = local_asset_public_url(local_path)
+        public_url = local_asset_public_url(local_ref)
         if public_url:
             return public_url
         raise HTTPException(
@@ -8976,8 +8983,9 @@ async def upload_image_for_apimart(client, provider, ref_url: str) -> str:
     ref_url = str(ref_url or "").strip()
     if not ref_url:
         return "ERR:空地址"
-    # 已经是网络 URL 或 asset:// → 直接可用，无需上传
-    if ref_url.startswith("http://") or ref_url.startswith("https://") or ref_url.startswith("asset://"):
+    if ref_url.startswith("asset://"):
+        return ref_url
+    if (ref_url.startswith("http://") or ref_url.startswith("https://")) and not resolve_local_media_reference(ref_url):
         return ref_url
     base_url = video_api_root(provider)
     upload_url = f"{base_url}/v1/uploads/images"
@@ -9005,9 +9013,10 @@ async def upload_image_for_apimart(client, provider, ref_url: str) -> str:
         except Exception as e:
             print(f"APIMart 上传 data URL 异常: {e}")
             return f"ERR:上传异常 {e}"
-    # 本地 /output/ 或 /assets/ 路径：先确认文件存在再上传
-    if ref_url.startswith("/output/") or ref_url.startswith("/assets/"):
-        path = output_file_from_url(ref_url)
+    # 本地画布文件：先确认文件存在再上传
+    local_ref = resolve_local_media_reference(ref_url)
+    if local_ref:
+        path = output_file_from_url(local_ref)
         if not path:
             print(f"APIMart 上传跳过：本地文件不存在 {ref_url}")
             return "ERR:本地文件不存在或已被删除"
@@ -9028,7 +9037,7 @@ async def upload_image_for_apimart(client, provider, ref_url: str) -> str:
         except Exception as e:
             print(f"APIMart 文件上传异常: {e}")
             return f"ERR:上传异常 {e}"
-    return "ERR:不支持的图片来源（仅支持 http/https/asset/data 或本地 /output/ /assets/ 路径）"
+    return "ERR:不支持的图片来源（仅支持 http/https/asset/data 或本地 /output/ /assets/ /api/storage-files/ 路径）"
 
 async def upload_video_for_apimart(client, provider, ref_url: str) -> str:
     """尽力把本地参考视频转换为 APIMart 可接受的 http/https 或 asset:// URL。
@@ -9359,11 +9368,12 @@ def local_media_path_for_cloud_upload(ref_url: str, allowed_prefixes=("image/", 
     ref_url = str(ref_url or "").strip()
     if not ref_url:
         raise HTTPException(status_code=400, detail="没有可上传的媒体文件")
-    if ref_url.startswith("http://") or ref_url.startswith("https://"):
+    if (ref_url.startswith("http://") or ref_url.startswith("https://")) and not resolve_local_media_reference(ref_url):
         return ""
-    if not (ref_url.startswith("/output/") or ref_url.startswith("/assets/")):
+    local_ref = resolve_local_media_reference(ref_url)
+    if not local_ref:
         raise HTTPException(status_code=400, detail="云端上传只支持画布里的本地图片或视频文件")
-    path = output_file_from_url(ref_url)
+    path = output_file_from_url(local_ref)
     if not path:
         raise HTTPException(status_code=404, detail="本地媒体文件不存在或已被删除")
     ct = content_type_for_path(path)
@@ -9484,6 +9494,13 @@ def image_output_meta(url, source_item=None):
     if parsed_name:
         meta["name"] = parsed_name
     if isinstance(source_item, dict):
+        remote = ""
+        if str(source_item.get("type") or "").lower() == "url":
+            remote = str(source_item.get("value") or "").strip()
+        if not remote:
+            remote = str(source_item.get("url") or source_item.get("value") or "").strip()
+        if remote.startswith(("http://", "https://")):
+            meta["source_url"] = remote
         for key in ("natural_w", "natural_h", "width", "height", "w", "h", "layout_w", "layout_h"):
             try:
                 value = int(float(source_item.get(key) or 0))
@@ -14823,7 +14840,269 @@ def looks_like_html_response(text: str) -> bool:
     sample = str(text or "").lstrip()[:200].lower()
     return sample.startswith("<!doctype html") or sample.startswith("<html") or "<head" in sample
 
-def video_submit_url_candidates(provider, base_url):
+def is_minimax_h3_video_model(model: str) -> bool:
+    value = str(model or "").strip().lower().replace("_", "-").replace(".", "-")
+    return "minimax-h3" in value or value.endswith("/h3") or value == "h3"
+
+def minimax_h3_model_name(model: str) -> str:
+    if is_minimax_h3_video_model(model):
+        return "MiniMax-H3"
+    return selected_model(model, "MiniMax-H3")
+
+def minimax_h3_resolution(value: str) -> str:
+    text = str(value or "").strip().upper()
+    if text in {"2K", "2048", "1440"}:
+        return "2K"
+    return "768P"
+
+def minimax_h3_duration(value) -> int:
+    try:
+        seconds = int(round(float(value)))
+    except Exception:
+        seconds = 5
+    return max(4, min(15, seconds))
+
+def minimax_h3_aspect_ratio(value: str, reference_mode: bool) -> str:
+    ratio = str(value or "").strip()
+    allowed = {"21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
+    if reference_mode:
+        return ratio if ratio in allowed else "adaptive"
+    return ratio if ratio in allowed else "16:9"
+
+def reference_upstream_media_value(ref) -> str:
+    """优先返回上游可直接访问的公网素材 URL，再回退到本地画布地址。"""
+    if isinstance(ref, str):
+        return str(ref or "").strip()
+    source = {}
+    if isinstance(ref, dict):
+        source = ref
+    elif hasattr(ref, "model_dump"):
+        try:
+            source = ref.model_dump() or {}
+        except Exception:
+            source = {}
+    elif hasattr(ref, "dict"):
+        try:
+            source = ref.dict() or {}
+        except Exception:
+            source = {}
+    for key in ("source_url", "sourceUrl", "original_url", "originalRemoteUrl", "url"):
+        value = str(source.get(key) or "").strip()
+        if not value:
+            continue
+        if value.lower().startswith("asset://"):
+            return value
+        if value.startswith(("http://", "https://")) and not resolve_local_media_reference(value):
+            return value
+    return str(source.get("url") or "").strip()
+
+def extract_public_media_url(payload) -> str:
+    if isinstance(payload, list):
+        for item in payload:
+            value = extract_public_media_url(item)
+            if value:
+                return value
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("url", "asset_url", "assetUrl", "download_url", "downloadUrl", "file_url", "fileUrl"):
+        value = str(payload.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    for key in ("data", "file", "asset", "result"):
+        value = extract_public_media_url(payload.get(key))
+        if value:
+            return value
+    return ""
+
+def normalized_h3_image_upload_payload(path: str):
+    """Re-encode local references to a metadata-free JPEG before provider upload."""
+    with Image.open(path) as img:
+        img.load()
+        if max(img.size) > 5760:
+            img.thumbnail((5760, 5760), Image.LANCZOS)
+        rgba = img.convert("RGBA")
+        target = Image.new("RGB", rgba.size, (255, 255, 255))
+        target.paste(rgba, mask=rgba.split()[-1])
+        buf = BytesIO()
+        target.save(buf, format="JPEG", quality=94, optimize=True)
+    filename = os.path.splitext(os.path.basename(path))[0] + "_h3.jpg"
+    return filename, buf.getvalue(), "image/jpeg"
+
+async def upload_h3_image_to_provider_files(client, provider, value: str) -> Tuple[str, str]:
+    """Upload a local H3 image through the selected provider's OpenAI-compatible /v1/files route."""
+    local_ref = resolve_local_media_reference(value)
+    path = output_file_from_url(local_ref) if local_ref else None
+    if not path:
+        return "", "本地图片不存在"
+    base_url = video_api_root(provider)
+    if not base_url:
+        return "", "视频平台 Base URL 为空"
+    upload_url = f"{base_url}/v1/files"
+    try:
+        filename, content, content_type = normalized_h3_image_upload_payload(path)
+        response = await client.post(
+            upload_url,
+            headers=api_headers(json_body=False, provider=provider),
+            files={"file": (filename, content, content_type)},
+            data={"purpose": "video_generation"},
+            timeout=120,
+        )
+        if response.status_code not in (200, 201):
+            return "", f"/v1/files HTTP {response.status_code}: {(response.text or '')[:240]}"
+        try:
+            raw = response.json()
+        except Exception:
+            return "", f"/v1/files 返回非 JSON：{(response.text or '')[:240]}"
+        public_url = extract_public_media_url(raw)
+        if public_url:
+            return public_url, ""
+        file_obj = raw.get("file") if isinstance(raw.get("file"), dict) else raw
+        file_id = str((file_obj or {}).get("id") or (file_obj or {}).get("file_id") or "").strip()
+        if not file_id:
+            return "", f"/v1/files 未返回 URL 或 file_id：{str(raw)[:240]}"
+        # opc/MiniMax H3 keeps uploaded files private and resolves them inside the
+        # generation service through this scheme. A public /content URL is neither
+        # required nor reliable from the model worker's network.
+        return f"mm_file://{file_id}", ""
+    except Exception as exc:
+        return "", f"/v1/files 上传异常：{exc}"
+
+async def minimax_h3_public_media_url(client, provider, value: str, kind: str = "image") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://", "asset://", "mm_file://")) and not resolve_local_media_reference(text):
+        return text
+    if kind == "image":
+        errors = []
+        public_url = local_asset_public_url(text)
+        if public_url:
+            return public_url
+        if client and provider:
+            provider_url, provider_error = await upload_h3_image_to_provider_files(client, provider, text)
+            if provider_url:
+                return provider_url
+            if provider_error:
+                errors.append(provider_error)
+        try:
+            url = await openai_video_proxy_public_reference_url({"url": text})
+            if url:
+                return url
+        except HTTPException as exc:
+            errors.append(str(exc.detail))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"MiniMax H3 无法把参考图转成可解码的公网图片 URL：{'；'.join(errors)[:600] or text[:160]}\n"
+                "请在 API/.env 配置 PUBLIC_MEDIA_BASE_URL，或直接使用公开可访问的 JPG/PNG/WebP URL。"
+            ),
+        )
+    if kind in {"video", "audio"}:
+        if text.startswith("data:"):
+            return text
+        try:
+            uploaded = await upload_local_video_to_cloud(resolve_local_media_reference(text) or text)
+            return str((uploaded or {}).get("url") or "").strip()
+        except HTTPException:
+            public_url = local_asset_public_url(text)
+            if public_url:
+                return public_url
+            raise
+    return text
+
+async def build_minimax_h3_video_body(client, payload: CanvasVideoRequest, provider, requested_model: str) -> Dict[str, Any]:
+    image_refs = [ref for ref in (payload.images or []) if str(getattr(ref, "url", "") or "").strip()]
+    video_refs = [str(url or "").strip() for url in (payload.videos or []) if str(url or "").strip()]
+    audio_refs = [str(url or "").strip() for url in (payload.audios or []) if str(url or "").strip()]
+    image_roles = [str(getattr(ref, "role", "") or "").strip().lower() for ref in image_refs]
+    has_frame_roles = any(role in {"first_frame", "last_frame"} for role in image_roles)
+    reference_mode = bool(
+        payload.multimodal
+        or video_refs
+        or audio_refs
+        or (len(image_refs) > 1 and not has_frame_roles)
+    )
+    if has_frame_roles and reference_mode:
+        raise HTTPException(
+            status_code=400,
+            detail="MiniMax H3 的「首尾帧」和「全能参考」不能同时使用。请只保留其中一种输入方式。",
+        )
+
+    content: List[Dict[str, Any]] = [{"type": "text", "text": str(payload.prompt or "").strip()}]
+    invalid_refs: List[str] = []
+
+    async def append_image(ref, role: str):
+        url = await minimax_h3_public_media_url(client, provider, reference_upstream_media_value(ref), "image")
+        if not url:
+            invalid_refs.append(ref.name or reference_upstream_media_value(ref) or "参考图")
+            return
+        item = {"type": "image_url", "image_url": {"url": url}}
+        if role:
+            item["role"] = role
+        content.append(item)
+
+    if reference_mode:
+        for ref in image_refs[:9]:
+            await append_image(ref, "reference_image")
+        for ref_url in video_refs[:3]:
+            if looks_like_image_media_url(ref_url):
+                invalid_refs.append(ref_url)
+                continue
+            url = await minimax_h3_public_media_url(client, provider, reference_upstream_media_value({"url": ref_url}), "video")
+            if not url:
+                invalid_refs.append(ref_url)
+                continue
+            content.append({"type": "video_url", "video_url": {"url": url}, "role": "reference_video"})
+        for ref_url in audio_refs[:3]:
+            url = await minimax_h3_public_media_url(client, provider, ref_url, "audio")
+            if not url:
+                invalid_refs.append(ref_url)
+                continue
+            content.append({"type": "audio_url", "audio_url": {"url": url}, "role": "reference_audio"})
+    elif image_refs:
+        for index, ref in enumerate(image_refs[:2]):
+            role = str(getattr(ref, "role", "") or "").strip().lower()
+            if role not in {"first_frame", "last_frame"}:
+                role = "first_frame" if index == 0 else "last_frame"
+            await append_image(ref, role)
+    elif video_refs or audio_refs:
+        raise HTTPException(
+            status_code=400,
+            detail="MiniMax H3 的参考视频/音频必须搭配至少一张参考图，或开启「全能参考」模式。",
+        )
+
+    if invalid_refs:
+        sample = invalid_video_image_preview(str(invalid_refs[0]))
+        raise HTTPException(
+            status_code=400,
+            detail=f"MiniMax H3 无法读取参考素材：{sample}\n请确认文件存在，且本地素材已成功上传为公网 URL。",
+        )
+
+    media_count = sum(1 for item in content if item.get("type") != "text")
+    if media_count <= 0 and (payload.images or payload.videos or payload.audios):
+        raise HTTPException(
+            status_code=400,
+            detail="MiniMax H3 没有成功读取任何参考图/视频/音频。请检查输入素材是否为本地可访问文件或公网 URL。",
+        )
+
+    body = {
+        "model": minimax_h3_model_name(requested_model),
+        "content": content,
+        "resolution": minimax_h3_resolution(payload.resolution),
+        "duration": minimax_h3_duration(payload.duration),
+        "ratio": minimax_h3_aspect_ratio(payload.aspect_ratio, reference_mode),
+    }
+    if payload.seed is not None:
+        body["seed"] = payload.seed
+    return body
+
+def video_submit_url_candidates(provider, base_url, model=""):
+    if is_minimax_h3_video_model(model):
+        return [
+            f"{base_url}/v2/video_generation",
+            f"{base_url}/v1/video/generations",
+        ]
     if is_agnes_provider(provider):
         return [f"{base_url}/v1/videos"]
     if is_lingjing_provider(provider):
@@ -15630,9 +15909,10 @@ async def canvas_video(payload: CanvasVideoRequest):
     is_lingjing = is_lingjing_provider(provider)
     is_agnes = is_agnes_provider(provider, payload.model)
     volc_is_proxy = bool(is_volcengine and urllib.parse.urlparse(base_url).path.rstrip("/"))
-    submit_urls = video_submit_url_candidates(provider, base_url)
-    submit_url = submit_urls[0]
     requested_model = selected_model(payload.model, "agnes-video-v2.0" if is_agnes else "veo3-fast")
+    submit_urls = video_submit_url_candidates(provider, base_url, requested_model)
+    submit_url = submit_urls[0]
+    is_minimax_h3 = is_minimax_h3_video_model(requested_model)
     if is_tudou_provider(provider) and is_tudou_video_model(requested_model):
         try:
             async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as tudou_client:
@@ -15930,6 +16210,8 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["aspect_ratio"] = ratio
                     if payload.enable_upsample:
                         body["enable_upsample"] = True
+                elif is_minimax_h3:
+                    body = await build_minimax_h3_video_body(client, payload, provider, requested_model)
                 else:
                     image_payload = []
                     for ref in payload.images[:4]:

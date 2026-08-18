@@ -10815,7 +10815,7 @@ async function runRhModelNode(node, opts={}){
             let outputs = [];
             for(const task of taskInfos){
                 const result = await waitCanvasImageTaskResult(task.task_id, {cascadeTargetId});
-                outputs.push(...(result.images || []));
+                outputs.push(...(result.image_items?.length ? result.image_items : (result.images || [])));
                 run.request = requestMetaFromResult(result);
             }
             if(!outputs.length) throw new Error(tr('canvas.generationFailed'));
@@ -11114,7 +11114,13 @@ function generatedImageRefs(node){
             const url = outputUrlValue(item);
             if(!url) return null;
             const kind = mediaKindForOutputItem(item);
-            return {url, name:outputImageName(url) || `${node.type || 'generated'}-${i + 1}`, kind, index:i};
+            return {
+                url,
+                name:outputImageName(url) || `${node.type || 'generated'}-${i + 1}`,
+                kind,
+                index:i,
+                ...outputReferenceMeta(item)
+            };
         })
         .filter(Boolean)
         .filter(ref => keepGeneratedMedia || ref.kind === 'image')
@@ -11140,7 +11146,14 @@ function mediaRefsFromNode(node){
             const url = outputUrlValue(item);
             if(!url) return null;
             const kind = mediaKindForOutputItem(item);
-            return {url, name:outputImageName(url) || `output-${i + 1}`, kind, nodeId:node.id, outputIndex:i};
+            return {
+                url,
+                name:outputImageName(url) || `output-${i + 1}`,
+                kind,
+                nodeId:node.id,
+                outputIndex:i,
+                ...outputReferenceMeta(item)
+            };
         }).filter(Boolean);
     }
     if(CANVAS_MEDIA_OUTPUT_TYPES.includes(node.type)) return generatedImageRefs(node);
@@ -11155,7 +11168,15 @@ function generatorSources(gen){
             if(found){
                 const last = outputUrlValue(found.item);
                 const kind = mediaKindForOutputItem(found.item);
-                return {id:n.id, type:'outputImage', label:'上游输出', preview:last, refs:[{url:last, name:'output.png', kind, nodeId:n.id, outputIndex:found.index}], prompt:''};
+                const ref = {
+                    url:last,
+                    name:'output.png',
+                    kind,
+                    nodeId:n.id,
+                    outputIndex:found.index,
+                    ...outputReferenceMeta(found.item)
+                };
+                return {id:n.id, type:'outputImage', label:'上游输出', preview:last, refs:[ref], prompt:''};
             }
         }
         if(CANVAS_MEDIA_OUTPUT_TYPES.includes(n.type)){
@@ -11332,7 +11353,7 @@ async function runGenerator(genId, opts={}){
             let outputs = [];
             for(const task of taskInfos){
                 const result = await waitCanvasImageTaskResult(task.task_id, {cascadeTargetId});
-                outputs.push(...(result.images || []));
+                outputs.push(...(result.image_items?.length ? result.image_items : (result.images || [])));
                 run.request = requestMetaFromResult(result);
             }
             if(!outputs.length) throw new Error(tr('canvas.generationFailed'));
@@ -11579,7 +11600,7 @@ async function runGeneratorLegacy(genId, opts={}){
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify(payload)
         }).then(async r => { if(!r.ok) throw new Error(await responseErrorMessage(r, tr('canvas.generationFailed'))); return r.json(); })));
-        const images = results.flatMap(result => result.images || []);
+        const images = results.flatMap(result => result.image_items?.length ? result.image_items : (result.images || []));
         const metas = collectRunMetas(out, pendingIds);
         run.request = results[0] ? requestMetaFromResult(results[0]) : {};
         if(out) out._pending = (out._pending||[]).filter(p => !pendingIds.includes(p.id));
@@ -11975,7 +11996,12 @@ function resultMediaUrls(result){
         if(typeof value === 'object'){
             if(value.url || value.path || value.src || value.uri){
                 const url = value.url || value.path || value.src || value.uri;
-                if(url) urls.push({url, kind:value.kind || value.type || value.mediaKind || '', name:value.name || value.filename || ''});
+                if(url) urls.push({
+                    url,
+                    kind:value.kind || value.type || value.mediaKind || '',
+                    name:value.name || value.filename || '',
+                    ...outputReferenceMeta(value)
+                });
             }
             ['outputs','videos','images','urls','data','result','content','files'].forEach(key => add(value[key]));
             ['url','path','src','uri','output','output_url','outputUrl','video','video_url','videoUrl','mp4_url','mp4Url','download_url','downloadUrl','preview_url','previewUrl','result_url','resultUrl'].forEach(key => add(value[key]));
@@ -13300,6 +13326,17 @@ function nowMs(){ return Date.now(); }
 function outputUrlValue(item){
     return typeof item === 'string' ? item : item?.url || '';
 }
+function outputReferenceMeta(item){
+    if(!item || typeof item !== 'object') return {};
+    const meta = {};
+    [
+        'source_url', 'sourceUrl', 'original_url', 'originalRemoteUrl', 'originalLocalUrl',
+        'mime', 'width', 'height', 'natural_w', 'natural_h', 'w', 'h'
+    ].forEach(key => {
+        if(item[key] !== undefined && item[key] !== null && item[key] !== '') meta[key] = item[key];
+    });
+    return meta;
+}
 function isMissingAssetUrl(url){
     return Boolean(url && missingAssetUrls.has(url));
 }
@@ -13522,7 +13559,11 @@ function mergeGeneratedOutputs(node, outputs, append=false){
                 ? 'video'
                 : mediaKindForOutputItem(item);
         if(!keepGeneratedMedia && kind !== 'image') return null;
-        return kind === 'image' ? url : {url, kind};
+        if(kind !== 'image') return {url, kind, ...outputReferenceMeta(item)};
+        const meta = outputReferenceMeta(item);
+        return Object.keys(meta).length || (item && typeof item === 'object' && item.name)
+            ? {url, kind:'image', name:item?.name || outputImageName(url), ...meta}
+            : url;
     }).filter(Boolean);
     if(!append){
         node.generatedOutputs = clean;
@@ -13610,7 +13651,7 @@ function providerIdForPending(pending){
 }
 function completeRecoverPendingOutput(out, pending, result){
     if(!out || !pending || !result) return;
-    const images = result.images || [];
+    const images = result.image_items?.length ? result.image_items : (result.images || []);
     if(!images.length) return;
     const meta = {
         runMs: nowMs() - Number(pending.startedAt || nowMs()),
@@ -13734,7 +13775,7 @@ function completeCanvasImageTask(taskId, result){
         run: pending.run || {},
     };
     meta.run.request = requestMetaFromResult(result);
-    const images = result.images || [];
+    const images = result.image_items?.length ? result.image_items : (result.images || []);
     out._pending = (out._pending || []).filter(p => p.id !== pending.id);
     appendOutputImages(out, images, meta.run?.refs?.[0], [meta]);
     const gen = nodes.find(n => n.id === meta.run?.node?.id);
@@ -13862,6 +13903,7 @@ function appendOutputImages(out, images, compareRef, metas=[], layout=null){
         const item = {url:outputUrlValue(url), viewed:false, runMs:meta.runMs || 0, run:meta.run || null};
         if(source.name) item.name = source.name;
         if(source.kind || source.mediaKind) item.kind = source.kind || source.mediaKind;
+        Object.assign(item, outputReferenceMeta(source));
         if(meta.kind) item.kind = meta.kind;
         if(meta.grid) item.grid = meta.grid;
         return item;
