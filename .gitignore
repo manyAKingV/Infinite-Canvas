@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Bundled Windows runtime and offline wheels
+python/
+packages/
+get-pip.py
+
+# Local runtime data
+data/
+assets/input/
+assets/output/
+assets/uploads/
+assets/library/
+output/
+logs/
+*.log
+history.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+
+# Leftover editor backups / accidental copies
+*.bak
+*.backup
+*.mojibake-backup
+*.broken-*
+*.stable-before-*
+static/js/i18n(1)/
